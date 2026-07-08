@@ -21,7 +21,7 @@ import numpy as np
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from PIL import Image
+from PIL import Image, ImageDraw
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("jeunesse-africaine-api")
@@ -32,6 +32,11 @@ logger = logging.getLogger("jeunesse-africaine-api")
 # ----------------------------------------------------------------------------
 POSTER_PATH = "poster_template.png"
 FRAME_X, FRAME_Y, FRAME_W, FRAME_H = 741, 169, 473, 652
+# Le cadre imprimé a des coins très arrondis (~70-75px mesurés sur l'affiche).
+# On applique le même arrondi + une petite marge pour ne jamais déborder sur
+# le trait de pinceau orange/vert du cadre.
+FRAME_INSET = 9
+FRAME_RADIUS = 62
 FACE_VERTICAL_BIAS = 0.10  # laisse un peu plus d'espace sous le visage pour le buste
 SUBJECT_ZOOM = 1.08        # léger zoom pour un cadrage plus serré et flatteur
 
@@ -106,6 +111,27 @@ def remove_background(rgba_or_rgb_bytes: bytes) -> Image.Image:
     return Image.open(io.BytesIO(output_bytes)).convert("RGBA")
 
 
+def apply_rounded_frame_mask(subject: Image.Image) -> Image.Image:
+    """
+    Applique un masque à coins très arrondis (identique au cadre imprimé) sur
+    le sujet déjà recadré à la taille du cadre, avec une petite marge pour ne
+    jamais chevaucher le trait de pinceau du cadre.
+    """
+    w, h = subject.size
+    mask = Image.new("L", (w, h), 0)
+    draw = ImageDraw.Draw(mask)
+    draw.rounded_rectangle(
+        [FRAME_INSET, FRAME_INSET, w - FRAME_INSET, h - FRAME_INSET],
+        radius=FRAME_RADIUS,
+        fill=255,
+    )
+    # combine avec le canal alpha existant (transparence déjà retirée par rembg)
+    r, g, b, a = subject.split()
+    combined_alpha = Image.composite(a, Image.new("L", (w, h), 0), mask)
+    subject.putalpha(combined_alpha)
+    return subject
+
+
 def smart_crop_and_fit(subject: Image.Image, original_rgb: np.ndarray) -> Image.Image:
     """
     Recadre et redimensionne le sujet (déjà détouré) pour remplir exactement
@@ -171,6 +197,7 @@ async def compose(photo: UploadFile = File(...)):
         raise HTTPException(500, "Échec du traitement IA (arrière-plan).") from exc
 
     cropped = smart_crop_and_fit(subject_rgba, original_np)
+    cropped = apply_rounded_frame_mask(cropped)
     final_poster = compose_poster(cropped)
 
     # à ce stade, `raw_bytes` / `original` / `subject_rgba` ne sont référencés
@@ -188,3 +215,4 @@ async def compose(photo: UploadFile = File(...)):
             "Content-Disposition": 'inline; filename="jeunesse-africaine-en-action.png"'
         },
     )
+  
