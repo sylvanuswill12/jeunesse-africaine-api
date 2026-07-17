@@ -14,8 +14,17 @@ Conforme au cahier des charges (§4.2 et §4.3) :
   - Aucune base de données.
 """
 
+import gc
 import io
 import logging
+import os
+
+# Réduit l'empreinte mémoire du moteur d'inférence IA (chaque thread
+# supplémentaire alloue ses propres buffers) — important sur une instance
+# à 512 Mo de RAM. À placer avant tout import d'onnxruntime/rembg.
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("OMP_WAIT_POLICY", "PASSIVE")
+os.environ.setdefault("ORT_NUM_THREADS", "1")
 
 import numpy as np
 from fastapi import FastAPI, File, HTTPException, UploadFile
@@ -25,6 +34,12 @@ from PIL import Image, ImageDraw
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("jeunesse-africaine-api")
+
+# Limite anti-surcharge mémoire : les photos de téléphone modernes (12+
+# mégapixels) font exploser la RAM du modèle IA sur un plan gratuit (512 Mo).
+# On downscale systématiquement avant tout traitement — largement suffisant
+# puisque la photo finale n'occupe qu'une petite portion de l'affiche.
+MAX_INPUT_DIMENSION = 1280
 
 # ----------------------------------------------------------------------------
 # Configuration — coordonnées exactes du cadre, mesurées sur l'affiche officielle
@@ -171,6 +186,18 @@ def compose_poster(subject_crop: Image.Image) -> Image.Image:
     return poster
 
 
+def downscale_if_needed(img: Image.Image) -> Image.Image:
+    """Réduit une photo trop grande AVANT tout traitement IA, pour éviter
+    de saturer la mémoire (cause principale des plantages 'out of memory')."""
+    w, h = img.size
+    longest = max(w, h)
+    if longest <= MAX_INPUT_DIMENSION:
+        return img
+    scale = MAX_INPUT_DIMENSION / longest
+    new_size = (int(w * scale), int(h * scale))
+    return img.resize(new_size, Image.LANCZOS)
+
+
 @app.get("/api/health")
 def health():
     return {"status": "ok"}
@@ -188,25 +215,39 @@ async def compose(photo: UploadFile = File(...)):
     except Exception:
         raise HTTPException(400, "Image illisible ou corrompue.")
 
+    # Downscale immédiat : on ne garde plus jamais les octets originaux
+    # (potentiellement énormes) après cette étape.
+    original = downscale_if_needed(original)
+    del raw_bytes
+    resized_buffer = io.BytesIO()
+    original.save(resized_buffer, format="JPEG", quality=90)
+    resized_bytes = resized_buffer.getvalue()
+    resized_buffer.close()
+
     original_np = np.array(original)
 
     try:
-        subject_rgba = remove_background(raw_bytes)
+        subject_rgba = remove_background(resized_bytes)
     except Exception as exc:
         logger.exception("Échec de la suppression d'arrière-plan")
         raise HTTPException(500, "Échec du traitement IA (arrière-plan).") from exc
+    finally:
+        del resized_bytes
 
     cropped = smart_crop_and_fit(subject_rgba, original_np)
+    del subject_rgba, original_np, original
     cropped = apply_rounded_frame_mask(cropped)
     final_poster = compose_poster(cropped)
+    del cropped
 
-    # à ce stade, `raw_bytes` / `original` / `subject_rgba` ne sont référencés
-    # nulle part ailleurs : ils seront libérés par le garbage collector Python
-    # dès la fin de la requête — aucune écriture disque n'a eu lieu (RGPD).
+    # à ce stade, plus aucune grande image n'est retenue en mémoire — tout est
+    # libéré immédiatement (RGPD + stabilité sur l'instance gratuite Render).
+    gc.collect()
 
     buffer = io.BytesIO()
     final_poster.convert("RGB").save(buffer, format="PNG")
     buffer.seek(0)
+    del final_poster
 
     return StreamingResponse(
         buffer,
@@ -215,4 +256,3 @@ async def compose(photo: UploadFile = File(...)):
             "Content-Disposition": 'inline; filename="jeunesse-africaine-en-action.png"'
         },
     )
-  
