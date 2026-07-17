@@ -1,30 +1,34 @@
 """
-Backend IA — Jeunesse Africaine en Action
-==========================================
+Backend — Jeunesse Africaine en Action
+=======================================
 Fournit un point d'API unique qui :
   1. reçoit la photo de l'utilisateur,
   2. détecte le visage et calcule un recadrage centré (visage + buste),
-  3. supprime l'arrière-plan (modèle U^2-Net via la librairie `rembg`),
-  4. insère le sujet détouré dans le cadre exact de l'affiche officielle,
+  3. redimensionne/recadre la photo pour qu'elle remplisse EXACTEMENT le
+     cadre (comme un "cover" CSS) — garantit qu'il n'y a jamais ni zone
+     blanche, ni débordement, quelle que soit la photo envoyée,
+  4. insère la photo dans le cadre exact de l'affiche officielle, avec les
+     mêmes coins arrondis que le cadre imprimé,
   5. renvoie l'affiche personnalisée en PNG haute définition.
 
 Conforme au cahier des charges (§4.2 et §4.3) :
-  - La photo d'origine n'est JAMAIS écrite sur disque : tout est traité en mémoire
-    et supprimé dès la réponse envoyée (RGPD).
+  - La photo d'origine n'est JAMAIS écrite sur disque : tout est traité en
+    mémoire et supprimé dès la réponse envoyée (RGPD).
   - Aucune base de données.
+
+Note de conception : une version précédente supprimait aussi l'arrière-plan
+de la photo (modèle IA U^2-Net/rembg) pour un effet "détouré". Ça a été
+retiré : les zones où l'arrière-plan était supprimé devenaient transparentes,
+ce qui laissait apparaître le fond blanc de l'affiche à travers (visible
+comme des "taches blanches" dans le cadre) — en plus de consommer beaucoup
+de mémoire (cause de plantages "out of memory" sur l'instance gratuite).
+Le recadrage "cover" utilisé ici garantit mathématiquement une couverture
+à 100% du cadre, sans aucune zone transparente possible.
 """
 
 import gc
 import io
 import logging
-import os
-
-# Réduit l'empreinte mémoire du moteur d'inférence IA (chaque thread
-# supplémentaire alloue ses propres buffers) — important sur une instance
-# à 512 Mo de RAM. À placer avant tout import d'onnxruntime/rembg.
-os.environ.setdefault("OMP_NUM_THREADS", "1")
-os.environ.setdefault("OMP_WAIT_POLICY", "PASSIVE")
-os.environ.setdefault("ORT_NUM_THREADS", "1")
 
 import numpy as np
 from fastapi import FastAPI, File, HTTPException, UploadFile
@@ -35,32 +39,20 @@ from PIL import Image, ImageDraw
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("jeunesse-africaine-api")
 
-# Limite anti-surcharge mémoire : les photos de téléphone modernes (12+
-# mégapixels) font exploser la RAM du modèle IA sur un plan gratuit (512 Mo).
-# On downscale systématiquement avant tout traitement — largement suffisant
-# puisque la photo finale n'occupe qu'une petite portion de l'affiche.
 MAX_INPUT_DIMENSION = 1280
 
-# ----------------------------------------------------------------------------
-# Configuration — coordonnées exactes du cadre, mesurées sur l'affiche officielle
-# (image 1254x1254 px fournie par l'ONG-AIL4C)
-# ----------------------------------------------------------------------------
 POSTER_PATH = "poster_template.png"
 FRAME_X, FRAME_Y, FRAME_W, FRAME_H = 741, 169, 473, 652
-# Le cadre imprimé a des coins très arrondis (~70-75px mesurés sur l'affiche).
-# On applique le même arrondi + une petite marge pour ne jamais déborder sur
-# le trait de pinceau orange/vert du cadre.
-FRAME_INSET = 9
-FRAME_RADIUS = 62
-FACE_VERTICAL_BIAS = 0.10  # laisse un peu plus d'espace sous le visage pour le buste
-SUBJECT_ZOOM = 1.08        # léger zoom pour un cadrage plus serré et flatteur
+FRAME_INSET = 16
+FRAME_RADIUS = 58
+FACE_VERTICAL_BIAS = 0.10
+SUBJECT_ZOOM = 1.08
 
 app = FastAPI(
     title="Jeunesse Africaine en Action — API de composition d'affiche",
-    version="1.0.0",
+    version="1.1.0",
 )
 
-# En production, restreindre allow_origins au domaine réel du site (Netlify, etc.)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -68,12 +60,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-_poster_cache: Image.Image | None = None
+_poster_cache = None
 _face_cascade = None
-_rembg_session = None
 
 
-def get_poster() -> Image.Image:
+def get_poster():
     global _poster_cache
     if _poster_cache is None:
         _poster_cache = Image.open(POSTER_PATH).convert("RGBA")
@@ -81,31 +72,17 @@ def get_poster() -> Image.Image:
 
 
 def get_face_cascade():
-    """Détecteur de visage léger (Haar cascade, livré avec opencv-python)."""
     global _face_cascade
     if _face_cascade is None:
         import cv2
-
         _face_cascade = cv2.CascadeClassifier(
             cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
         )
     return _face_cascade
 
 
-def get_rembg_session():
-    """Session rembg (modèle U^2-Net), chargée une seule fois au démarrage."""
-    global _rembg_session
-    if _rembg_session is None:
-        from rembg import new_session
-
-        _rembg_session = new_session("u2net")
-    return _rembg_session
-
-
-def detect_face_box(rgb_image: np.ndarray):
-    """Retourne (x, y, w, h) du plus grand visage détecté, ou None."""
+def detect_face_box(rgb_image):
     import cv2
-
     gray = cv2.cvtColor(rgb_image, cv2.COLOR_RGB2GRAY)
     cascade = get_face_cascade()
     faces = cascade.detectMultiScale(
@@ -113,25 +90,10 @@ def detect_face_box(rgb_image: np.ndarray):
     )
     if len(faces) == 0:
         return None
-    # on garde le plus grand visage détecté (sujet principal)
     return max(faces, key=lambda f: f[2] * f[3])
 
 
-def remove_background(rgba_or_rgb_bytes: bytes) -> Image.Image:
-    """Supprime l'arrière-plan et renvoie une image RGBA avec canal alpha."""
-    from rembg import remove
-
-    session = get_rembg_session()
-    output_bytes = remove(rgba_or_rgb_bytes, session=session)
-    return Image.open(io.BytesIO(output_bytes)).convert("RGBA")
-
-
-def apply_rounded_frame_mask(subject: Image.Image) -> Image.Image:
-    """
-    Applique un masque à coins très arrondis (identique au cadre imprimé) sur
-    le sujet déjà recadré à la taille du cadre, avec une petite marge pour ne
-    jamais chevaucher le trait de pinceau du cadre.
-    """
+def apply_rounded_frame_mask(subject):
     w, h = subject.size
     mask = Image.new("L", (w, h), 0)
     draw = ImageDraw.Draw(mask)
@@ -140,36 +102,26 @@ def apply_rounded_frame_mask(subject: Image.Image) -> Image.Image:
         radius=FRAME_RADIUS,
         fill=255,
     )
-    # combine avec le canal alpha existant (transparence déjà retirée par rembg)
-    r, g, b, a = subject.split()
-    combined_alpha = Image.composite(a, Image.new("L", (w, h), 0), mask)
-    subject.putalpha(combined_alpha)
+    subject.putalpha(mask)
     return subject
 
 
-def smart_crop_and_fit(subject: Image.Image, original_rgb: np.ndarray) -> Image.Image:
-    """
-    Recadre et redimensionne le sujet (déjà détouré) pour remplir exactement
-    le cadre FRAME_W x FRAME_H, en centrant sur le visage détecté si possible.
-    """
+def smart_crop_and_fit(photo_rgba, original_rgb):
     face = detect_face_box(original_rgb)
-    iw, ih = subject.size
+    iw, ih = photo_rgba.size
 
-    # échelle "cover" : l'image remplit entièrement le cadre
     base_scale = max(FRAME_W / iw, FRAME_H / ih) * SUBJECT_ZOOM
-    new_w, new_h = int(iw * base_scale), int(ih * base_scale)
-    resized = subject.resize((new_w, new_h), Image.LANCZOS)
+    new_w, new_h = int(iw * base_scale) + 1, int(ih * base_scale) + 1
+    resized = photo_rgba.resize((new_w, new_h), Image.LANCZOS)
 
     if face is not None:
         fx, fy, fw, fh = face
         face_cx = (fx + fw / 2) * base_scale
         face_cy = (fy + fh / 2) * base_scale
     else:
-        # pas de visage détecté : on centre simplement l'image (fallback)
         face_cx = new_w / 2
-        face_cy = new_h / 2 - FRAME_H * FACE_VERTICAL_BIAS
+        face_cy = new_h / 2
 
-    # décalage vertical pour laisser de la place au buste sous le visage
     face_cy -= FRAME_H * FACE_VERTICAL_BIAS
 
     left = int(max(0, min(new_w - FRAME_W, face_cx - FRAME_W / 2)))
@@ -179,16 +131,13 @@ def smart_crop_and_fit(subject: Image.Image, original_rgb: np.ndarray) -> Image.
     return cropped
 
 
-def compose_poster(subject_crop: Image.Image) -> Image.Image:
-    """Colle le sujet détouré dans le cadre de l'affiche officielle."""
+def compose_poster(subject_crop):
     poster = get_poster()
     poster.alpha_composite(subject_crop, dest=(FRAME_X, FRAME_Y))
     return poster
 
 
-def downscale_if_needed(img: Image.Image) -> Image.Image:
-    """Réduit une photo trop grande AVANT tout traitement IA, pour éviter
-    de saturer la mémoire (cause principale des plantages 'out of memory')."""
+def downscale_if_needed(img):
     w, h = img.size
     longest = max(w, h)
     if longest <= MAX_INPUT_DIMENSION:
@@ -208,40 +157,24 @@ async def compose(photo: UploadFile = File(...)):
     if not photo.content_type or not photo.content_type.startswith("image/"):
         raise HTTPException(400, "Le fichier envoyé doit être une image.")
 
-    raw_bytes = await photo.read()  # gardé en mémoire uniquement
+    raw_bytes = await photo.read()
 
     try:
         original = Image.open(io.BytesIO(raw_bytes)).convert("RGB")
     except Exception:
         raise HTTPException(400, "Image illisible ou corrompue.")
 
-    # Downscale immédiat : on ne garde plus jamais les octets originaux
-    # (potentiellement énormes) après cette étape.
-    original = downscale_if_needed(original)
     del raw_bytes
-    resized_buffer = io.BytesIO()
-    original.save(resized_buffer, format="JPEG", quality=90)
-    resized_bytes = resized_buffer.getvalue()
-    resized_buffer.close()
-
+    original = downscale_if_needed(original)
     original_np = np.array(original)
+    photo_rgba = original.convert("RGBA")
 
-    try:
-        subject_rgba = remove_background(resized_bytes)
-    except Exception as exc:
-        logger.exception("Échec de la suppression d'arrière-plan")
-        raise HTTPException(500, "Échec du traitement IA (arrière-plan).") from exc
-    finally:
-        del resized_bytes
-
-    cropped = smart_crop_and_fit(subject_rgba, original_np)
-    del subject_rgba, original_np, original
+    cropped = smart_crop_and_fit(photo_rgba, original_np)
+    del photo_rgba, original_np, original
     cropped = apply_rounded_frame_mask(cropped)
     final_poster = compose_poster(cropped)
     del cropped
 
-    # à ce stade, plus aucune grande image n'est retenue en mémoire — tout est
-    # libéré immédiatement (RGPD + stabilité sur l'instance gratuite Render).
     gc.collect()
 
     buffer = io.BytesIO()
@@ -255,4 +188,5 @@ async def compose(photo: UploadFile = File(...)):
         headers={
             "Content-Disposition": 'inline; filename="jeunesse-africaine-en-action.png"'
         },
-    )
+  )
+  
