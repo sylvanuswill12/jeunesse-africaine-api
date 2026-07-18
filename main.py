@@ -16,14 +16,15 @@ Conforme au cahier des charges (§4.2 et §4.3) :
     mémoire et supprimé dès la réponse envoyée (RGPD).
   - Aucune base de données.
 
-Note de conception : une version précédente supprimait aussi l'arrière-plan
-de la photo (modèle IA U^2-Net/rembg) pour un effet "détouré". Ça a été
-retiré : les zones où l'arrière-plan était supprimé devenaient transparentes,
-ce qui laissait apparaître le fond blanc de l'affiche à travers (visible
-comme des "taches blanches" dans le cadre) — en plus de consommer beaucoup
-de mémoire (cause de plantages "out of memory" sur l'instance gratuite).
-Le recadrage "cover" utilisé ici garantit mathématiquement une couverture
-à 100% du cadre, sans aucune zone transparente possible.
+Note de conception (v1.2) : le cadre imprimé est peint à la main, donc pas
+parfaitement géométrique — aucun rectangle à coins arrondis (même bien
+réglé) ne colle parfaitement à son contour réel : soit ça déborde, soit ça
+laisse un espace blanc visible selon l'endroit. La v1.2 corrige ça
+définitivement : le masque de découpe (`frame_mask.png`) est extrait
+pixel par pixel directement depuis l'affiche officielle elle-même (la vraie
+zone blanche intérieure du cadre), et non plus approximé par une formule.
+Résultat : la photo épouse exactement le contour réel du cadre peint, sans
+jamais déborder ni laisser d'espace blanc, quel que soit l'endroit.
 """
 
 import gc
@@ -34,7 +35,7 @@ import numpy as np
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from PIL import Image, ImageDraw
+from PIL import Image
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("jeunesse-africaine-api")
@@ -42,15 +43,14 @@ logger = logging.getLogger("jeunesse-africaine-api")
 MAX_INPUT_DIMENSION = 1280
 
 POSTER_PATH = "poster_template.png"
+FRAME_MASK_PATH = "frame_mask.png"  # masque exact extrait de l'affiche (voir note ci-dessus)
 FRAME_X, FRAME_Y, FRAME_W, FRAME_H = 741, 169, 473, 652
-FRAME_INSET = 16
-FRAME_RADIUS = 58
 FACE_VERTICAL_BIAS = 0.10
 SUBJECT_ZOOM = 1.08
 
 app = FastAPI(
     title="Jeunesse Africaine en Action — API de composition d'affiche",
-    version="1.1.0",
+    version="1.2.0",
 )
 
 app.add_middleware(
@@ -61,6 +61,7 @@ app.add_middleware(
 )
 
 _poster_cache = None
+_frame_mask_cache = None
 _face_cascade = None
 
 
@@ -69,6 +70,17 @@ def get_poster():
     if _poster_cache is None:
         _poster_cache = Image.open(POSTER_PATH).convert("RGBA")
     return _poster_cache.copy()
+
+
+def get_frame_mask():
+    """Charge le masque exact du cadre (extrait pixel par pixel de l'affiche)."""
+    global _frame_mask_cache
+    if _frame_mask_cache is None:
+        _frame_mask_cache = Image.open(FRAME_MASK_PATH).convert("L")
+        assert _frame_mask_cache.size == (FRAME_W, FRAME_H), (
+            f"frame_mask.png doit faire exactement {FRAME_W}x{FRAME_H}px"
+        )
+    return _frame_mask_cache
 
 
 def get_face_cascade():
@@ -93,16 +105,10 @@ def detect_face_box(rgb_image):
     return max(faces, key=lambda f: f[2] * f[3])
 
 
-def apply_rounded_frame_mask(subject):
-    w, h = subject.size
-    mask = Image.new("L", (w, h), 0)
-    draw = ImageDraw.Draw(mask)
-    draw.rounded_rectangle(
-        [FRAME_INSET, FRAME_INSET, w - FRAME_INSET, h - FRAME_INSET],
-        radius=FRAME_RADIUS,
-        fill=255,
-    )
-    subject.putalpha(mask)
+def apply_exact_frame_mask(subject):
+    """Applique le masque EXACT du cadre (extrait de l'affiche) — pas une
+    approximation géométrique. Garantit un contour pixel-perfect."""
+    subject.putalpha(get_frame_mask())
     return subject
 
 
@@ -171,7 +177,7 @@ async def compose(photo: UploadFile = File(...)):
 
     cropped = smart_crop_and_fit(photo_rgba, original_np)
     del photo_rgba, original_np, original
-    cropped = apply_rounded_frame_mask(cropped)
+    cropped = apply_exact_frame_mask(cropped)
     final_poster = compose_poster(cropped)
     del cropped
 
@@ -188,5 +194,5 @@ async def compose(photo: UploadFile = File(...)):
         headers={
             "Content-Disposition": 'inline; filename="jeunesse-africaine-en-action.png"'
         },
-  )
-  
+                                                               )
+      
